@@ -1,0 +1,77 @@
+{
+  "appId": "com.pppoker.overlay",
+  "productName": "PPPoker Overlay",
+  "directories": {
+    "output": "dist-electron"
+  },
+  "files": [
+    "src/**/*",
+    "package.json",
+    "!src/**/*.test.ts",
+    "!src/**/*.spec.ts",
+    "!src/__tests__/**/*",
+    "!src/**/*.tsx",
+    "!src/**/*.ts",
+    "!src/**/*.d.ts",
+    "!**/*.map",
+    "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme,test,tests,src,lib,build,dist,example,examples,docs,dist-electron,.vscode,.github,.gitignore,.npmignore,.eslintrc.js,.eslintrc.json,.prettierrc,.prettierrc.js,.prettierrc.json,tsconfig.json,vite.config.ts,vitest.config.ts,playwright.config.ts}",
+    "!**/node_modules/*/{*.md,*.json,*.js,*.cjs,*.mjs,*.jsx,*.tsx,*.ts}",
+    "!**/node_modules/*/{bin,lib,build,dist,example,examples,docs}",
+    "!**/node_modules/*/{.vscode,.github,.gitignore,.npmignore,.eslintrc.js,.eslintrc.json,.prettierrc,.prettierrc.js,.prettierrc.json,tsconfig.json,vite.config.ts,vitest.config.ts,playwright.config.ts}"
+  ],
+  "extraResources": [
+    {
+      "from": "node_modules/@xenova/transformers/dist/ort-wasm-wasm32-wasi.wasm",
+      "to": "resources/ort-wasm-wasm32-wasi.wasm"
+    },
+    {
+      "from": "node_modules/tesseract.js/dist/",
+      "to": "resources/tesseract"
+    }
+  ],
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      }
+    ],
+    "icon": "resources/icon.ico",
+    "requestedExecutionLevel": "asInvoker",
+    "signingHashAlgorithms": ["sha256"],
+    "verifyUpdateCodeSignature": false
+  },
+  "mac": {
+    "target": [
+      {
+        "target": "dmg",
+        "arch": ["x64", "arm64"]
+      }
+    ],
+    "icon": "resources/icon.icns",
+    "hardenedRuntime": true,
+    "gatekeeperAssess": false,
+    "entitlements": "resources/entitlements.mac.plist",
+    "entitlementsInherit": "resources/entitlements.mac.plist"
+  },
+  "linux": {
+    "target": [
+      {
+        "target": "AppImage",
+        "arch": ["x64"]
+      }
+    ],
+    "icon": "resources/icon.png",
+    "category": "Game"
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "PPPoker Overlay",
+    "uninstallDisplayName": "PPPoker Overlay"
+  },
+  "artifactName": "${productName}-${version}-${arch}.${ext}",
+  "publish": null
+}
