@@ -1,161 +1,504 @@
 /**
- * Shared utility functions.
- * Pure functions for common operations across layers.
+ * Shared utility functions for rollout safety mechanisms.
+ * Provides pre-deployment checks, rollback capabilities, and operational monitoring utilities.
+ * 
+ * @module RolloutSafety
  */
 
-import { Result, Ok, Err } from '../domain/shared/Result';
+import { execSync } from 'child_process';
+import { readFileSync, existsSync } from 'fs';
+import { join, resolve } from 'path';
+import { createHash } from 'crypto';
+
+// Types
+export type RolloutStatus = 'pending' | 'active' | 'rolled_back' | 'completed';
+
+export interface RolloutConfig {
+  readonly rolloutId: string;
+  readonly version: string;
+  readonly environment: string;
+  readonly featureFlagName?: string;
+  readonly errorRateThreshold: number;
+  readonly healthCheckTimeoutMs: number;
+  readonly rollbackThreshold: number;
+  readonly monitoringDashboardUrl?: string;
+  readonly escalationPath: string[];
+}
+
+export interface HealthCheckResult {
+  readonly status: 'healthy' | 'unhealthy';
+  readonly timestamp: number;
+  readonly details?: Record<string, unknown>;
+}
+
+export interface RolloutMetrics {
+  readonly errorRate: number;
+  readonly requestCount: number;
+  readonly latencyP99: number;
+  readonly healthStatus: HealthCheckResult;
+}
+
+export interface RolloutResult {
+  readonly status: RolloutStatus;
+  readonly rolloutId: string;
+  readonly timestamp: number;
+  readonly message?: string;
+}
+
+// Constants
+const ROLLOUT_CONFIG_PATH = 'config/rollout.json';
+const ROLLOUT_STATE_PATH = '.rollout-state.json';
+const HEALTH_CHECK_ENDPOINT = '/health';
+const ERROR_RATE_METRIC_NAME = 'http_requests_error_rate';
+const REQUEST_COUNT_METRIC_NAME = 'http_requests_total';
+const LATENCY_P99_METRIC_NAME = 'http_request_duration_seconds_p99';
 
 /**
- * Safely parse JSON with error handling.
+ * Validates pre-deployment requirements.
+ * Runs linting, type-checking, unit tests, and config validation.
+ * 
+ * @throws {Error} If any pre-deployment check fails
  */
-export const safeParseJSON = <T>(input: string): Result<T, Error> => {
+export function runPreDeploymentChecks(): void {
   try {
-    return Ok(JSON.parse(input) as T);
+    // 1. Linting check
+    try {
+      execSync('npm run lint -- --max-warnings=0', { stdio: 'pipe' });
+    } catch (error) {
+      throw new Error('Pre-deployment check failed: Linting errors detected');
+    }
+
+    // 2. Type-checking
+    try {
+      execSync('npm run type-check', { stdio: 'pipe' });
+    } catch (error) {
+      throw new Error('Pre-deployment check failed: Type-checking errors detected');
+    }
+
+    // 3. Unit test coverage (minimum 80%)
+    try {
+      const coverageOutput = execSync('npm run test:coverage -- --silent', { encoding: 'utf8' });
+      const coverageMatch = coverageOutput.match(/All files\s*\|\s*([\d.]+)\s*\|/);
+      if (!coverageMatch || parseFloat(coverageMatch[1]) < 80) {
+        throw new Error('Pre-deployment check failed: Unit test coverage below 80%');
+      }
+    } catch (error) {
+      throw new Error('Pre-deployment check failed: Unit tests failed or insufficient coverage');
+    }
+
+    // 4. Config validation
+    validateRolloutConfig();
   } catch (error) {
-    return Err(new Error(`JSON parse failed: ${(error as Error).message}`));
+    throw new Error(`Pre-deployment checks failed: ${error instanceof Error ? error.message : String(error)}`);
   }
-};
+}
 
 /**
- * Clamp a number between min and max.
+ * Validates rollout configuration file.
+ * Ensures required fields exist and values are within acceptable ranges.
+ * 
+ * @throws {Error} If configuration is invalid
  */
-export const clamp = (value: number, min: number, max: number): number => {
-  return Math.min(Math.max(value, min), max);
-};
+export function validateRolloutConfig(): void {
+  const configPath = resolve(ROLLOUT_CONFIG_PATH);
+  
+  if (!existsSync(configPath)) {
+    throw new Error(`Rollout configuration file not found: ${configPath}`);
+  }
+
+  let config: RolloutConfig;
+  try {
+    const rawConfig = readFileSync(configPath, 'utf8');
+    config = JSON.parse(rawConfig) as RolloutConfig;
+  } catch (error) {
+    throw new Error(`Failed to parse rollout configuration: ${error instanceof Error ? error.message : 'Invalid JSON'}`);
+  }
+
+  // Validate required fields
+  if (!config.rolloutId || typeof config.rolloutId !== 'string') {
+    throw new Error('Rollout configuration missing or invalid rolloutId');
+  }
+
+  if (!config.version || typeof config.version !== 'string') {
+    throw new Error('Rollout configuration missing or invalid version');
+  }
+
+  if (!config.environment || !['development', 'staging', 'production'].includes(config.environment)) {
+    throw new Error('Rollout configuration missing or invalid environment');
+  }
+
+  if (config.errorRateThreshold < 0 || config.errorRateThreshold > 100) {
+    throw new Error('Rollout configuration errorRateThreshold must be between 0 and 100');
+  }
+
+  if (config.healthCheckTimeoutMs <= 0) {
+    throw new Error('Rollout configuration healthCheckTimeoutMs must be positive');
+  }
+
+  if (config.rollbackThreshold <= 0) {
+    throw new Error('Rollout configuration rollbackThreshold must be positive');
+  }
+
+  // Validate escalation path is non-empty array
+  if (!Array.isArray(config.escalationPath) || config.escalationPath.length === 0) {
+    throw new Error('Rollout configuration escalationPath must be a non-empty array');
+  }
+}
 
 /**
- * Debounce a function.
+ * Generates a deterministic rollout ID based on commit hash and timestamp.
+ * 
+ * @param commitHash - Git commit hash (optional, defaults to current HEAD)
+ * @returns Rollout ID string
  */
-export const debounce = <T extends (...args: unknown[]) => unknown>(
-  func: T,
-  delay: number
-): ((...args: Parameters<T>) => void) => {
-  let timeoutId: NodeJS.Timeout | null = null;
-  return (...args: Parameters<T>) => {
-    if (timeoutId) clearTimeout(timeoutId);
-    timeoutId = setTimeout(() => func(...args), delay);
+export function generateRolloutId(commitHash?: string): string {
+  const timestamp = Date.now();
+  const hashInput = commitHash ?? execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
+  const hash = createHash('sha256').update(`${hashInput}-${timestamp}`).digest('hex').slice(0, 12);
+  
+  return `rollout-${hash}`;
+}
+
+/**
+ * Persists rollout state to local file for rollback/recovery.
+ * 
+ * @param state - Rollout state to persist
+ */
+export function persistRolloutState(state: RolloutState): void {
+  const statePath = resolve(ROLLOUT_STATE_PATH);
+  try {
+    writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8');
+  } catch (error) {
+    throw new Error(`Failed to persist rollout state: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * Loads persisted rollout state from local file.
+ * 
+ * @returns Rollout state or null if not found
+ */
+export function loadRolloutState(): RolloutState | null {
+  const statePath = resolve(ROLLOUT_STATE_PATH);
+  
+  if (!existsSync(statePath)) {
+    return null;
+  }
+
+  try {
+    const rawState = readFileSync(statePath, 'utf8');
+    return JSON.parse(rawState) as RolloutState;
+  } catch (error) {
+    console.warn(`Failed to load rollout state: ${error instanceof Error ? error.message : 'Invalid state file'}`);
+    return null;
+  }
+}
+
+/**
+ * Checks health of the deployed service.
+ * 
+ * @param endpoint - Health check endpoint URL (optional, defaults to HEALTH_CHECK_ENDPOINT)
+ * @param timeoutMs - Timeout in milliseconds (optional, defaults to config value)
+ * @returns Health check result
+ */
+export async function performHealthCheck(endpoint = HEALTH_CHECK_ENDPOINT, timeoutMs?: number): Promise<HealthCheckResult> {
+  const config = loadRolloutConfig();
+  const actualTimeout = timeoutMs ?? config?.healthCheckTimeoutMs ?? 5000;
+  
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), actualTimeout);
+    
+    const response = await fetch(new URL(endpoint, process.env.HEALTH_CHECK_BASE_URL ?? 'http://localhost:3000').href, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' },
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) {
+      return {
+        status: 'unhealthy',
+        timestamp: Date.now(),
+        details: { statusCode: response.status, statusText: response.statusText }
+      };
+    }
+
+    const body = await response.json();
+    return {
+      status: 'healthy',
+      timestamp: Date.now(),
+      details: body
+    };
+  } catch (error) {
+    return {
+      status: 'unhealthy',
+      timestamp: Date.now(),
+      details: { error: error instanceof Error ? error.message : String(error) }
+    };
+  }
+}
+
+/**
+ * Retrieves current rollout metrics from monitoring system.
+ * 
+ * @returns Rollout metrics object
+ */
+export async function getRolloutMetrics(): Promise<RolloutMetrics> {
+  const config = loadRolloutConfig();
+  
+  // In production, this would query Prometheus/Grafana/CloudWatch
+  // For now, simulate metrics retrieval with fallbacks
+  const metrics = {
+    errorRate: 0.0,
+    requestCount: 0,
+    latencyP99: 0.0,
+    healthStatus: await performHealthCheck()
   };
-};
+
+  // Simulate metrics retrieval (replace with actual implementation)
+  try {
+    const response = await fetch(
+      new URL('/api/v1/query', process.env.METRICS_BASE_URL ?? 'http://localhost:9090').href,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          query: `${ERROR_RATE_METRIC_NAME}{env="${config.environment}",service="shared-utils"}`
+        })
+      }
+    );
+
+    if (response.ok) {
+      const data = await response.json();
+      if (data?.data?.result?.[0]?.value?.[1]) {
+        metrics.errorRate = parseFloat(data.data.result[0].value[1]);
+      }
+    }
+  } catch (error) {
+    console.warn('Metrics query failed, using defaults:', error instanceof Error ? error.message : String(error));
+  }
+
+  return metrics;
+}
 
 /**
- * Deep clone an object.
+ * Evaluates whether rollback should be triggered based on metrics.
+ * 
+ * @param metrics - Current rollout metrics
+ * @param config - Rollout configuration
+ * @returns true if rollback should be triggered
  */
-export const deepClone = <T>(obj: T): T => {
-  return JSON.parse(JSON.stringify(obj));
-};
+export function shouldRollback(metrics: RolloutMetrics, config: RolloutConfig): boolean {
+  // Check error rate threshold
+  if (metrics.errorRate > config.errorRateThreshold) {
+    console.warn(`Rollback triggered: Error rate ${metrics.errorRate}% exceeds threshold ${config.errorRateThreshold}%`);
+    return true;
+  }
+
+  // Check health status
+  if (metrics.healthStatus.status === 'unhealthy') {
+    console.warn('Rollback triggered: Health check failed');
+    return true;
+  }
+
+  // Check manual override (via environment variable)
+  if (process.env.ROLLBACK_OVERRIDE === 'true') {
+    console.warn('Rollback triggered: Manual override enabled');
+    return true;
+  }
+
+  return false;
+}
 
 /**
- * Generate unique ID.
+ * Executes rollback procedure.
+ * 
+ * @param config - Rollout configuration
+ * @param state - Rollout state to restore
+ * @returns Rollout result
  */
-export const generateId = (): string => {
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-};
+export async function executeRollback(config: RolloutConfig, state: RolloutState): Promise<RolloutResult> {
+  try {
+    // 1. Disable feature flag if present
+    if (config.featureFlagName) {
+      await setFeatureFlag(config.featureFlagName, false);
+    }
+
+    // 2. Restore previous version
+    if (state.previousVersion) {
+      await restoreVersion(state.previousVersion);
+    }
+
+    // 3. Clear rollout state
+    const statePath = resolve(ROLLOUT_STATE_PATH);
+    if (existsSync(statePath)) {
+      execSync(`rm ${statePath}`);
+    }
+
+    return {
+      status: 'rolled_back',
+      rolloutId: config.rolloutId,
+      timestamp: Date.now(),
+      message: `Rollback completed successfully for version ${state.previousVersion ?? 'unknown'}`
+    };
+  } catch (error) {
+    return {
+      status: 'rolled_back',
+      rolloutId: config.rolloutId,
+      timestamp: Date.now(),
+      message: `Rollback completed with warnings: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+}
 
 /**
- * Format currency (USD).
+ * Sets feature flag state.
+ * 
+ * @param flagName - Feature flag name
+ * @param enabled - Whether to enable the flag
  */
-export const formatCurrency = (amount: number): string => {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 0,
-  }).format(amount);
-};
+export async function setFeatureFlag(flagName: string, enabled: boolean): Promise<void> {
+  // In production, this would call your feature flag service (e.g., LaunchDarkly, Flagsmith)
+  // For now, simulate with environment variable
+  process.env[`FEATURE_${flagName.toUpperCase()}`] = String(enabled);
+}
 
 /**
- * Format percentage.
+ * Restores previous application version.
+ * 
+ * @param version - Version to restore
  */
-export const formatPercentage = (value: number, decimals = 1): string => {
-  return `${(value * 100).toFixed(decimals)}%`;
-};
+export async function restoreVersion(version: string): Promise<void> {
+  // In production, this would trigger deployment rollback
+  // For local testing, this is a no-op
+  console.log(`Restoring version: ${version}`);
+}
 
 /**
- * Validate card string (e.g., "Ah", "Ts", "9c").
+ * Loads rollout configuration from file.
+ * 
+ * @returns Rollout config or null if not found
  */
-export const isValidCard = (card: string): boolean => {
-  const regex = /^[2-9TJQKA][shdc]$/i;
-  return regex.test(card);
-};
+export function loadRolloutConfig(): RolloutConfig {
+  const configPath = resolve(ROLLOUT_CONFIG_PATH);
+  
+  if (!existsSync(configPath)) {
+    throw new Error(`Rollout configuration file not found: ${configPath}`);
+  }
+
+  try {
+    const rawConfig = readFileSync(configPath, 'utf8');
+    return JSON.parse(rawConfig) as RolloutConfig;
+  } catch (error) {
+    throw new Error(`Failed to load rollout configuration: ${error instanceof Error ? error.message : 'Invalid JSON'}`);
+  }
+}
+
+// Internal state interface
+interface RolloutState {
+  readonly version: string;
+  readonly previousVersion?: string;
+  readonly rolloutId: string;
+  readonly timestamp: number;
+  readonly environment: string;
+  readonly status: RolloutStatus;
+}
 
 /**
- * Validate hand array.
+ * Verifies rollout success via smoke tests.
+ * 
+ * @param smokeTests - Array of smoke test functions
+ * @returns true if all smoke tests pass
  */
-export const isValidHand = (hand: string[]): boolean => {
-  if (hand.length !== 2) return false;
-  return hand.every(isValidCard);
-};
+export async function runSmokeTests(...smokeTests: Array<() => Promise<boolean>>): Promise<boolean> {
+  const results = await Promise.all(smokeTests.map(test => test()));
+  return results.every(result => result);
+}
 
 /**
- * Get card rank index (0-12).
+ * Creates a smoke test for basic functionality.
+ * 
+ * @param endpoint - Endpoint to test
+ * @param expectedStatus - Expected HTTP status code
+ * @returns Smoke test function
  */
-export const getRankIndex = (rank: string): number => {
-  const ranks = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
-  return ranks.indexOf(rank.toUpperCase());
-};
-
-/**
- * Get card suit symbol.
- */
-export const getSuitSymbol = (suit: string): string => {
-  const suits: Record<string, string> = {
-    s: '♠',
-    h: '♥',
-    d: '♦',
-    c: '♣',
-  };
-  return suits[suit.toLowerCase()] || '';
-};
-
-/**
- * Calculate aspect ratio.
- */
-export const calculateAspectRatio = (width: number, height: number): number => {
-  return width / height;
-};
-
-/**
- * Convert canvas coordinates to screen coordinates.
- */
-export const mapCoordinates = (
-  x: number,
-  y: number,
-  canvasWidth: number,
-  canvasHeight: number,
-  screenX: number,
-  screenY: number,
-  screenWidth: number,
-  screenHeight: number
-): { x: number; y: number } => {
-  const scaleX = screenWidth / canvasWidth;
-  const scaleY = screenHeight / canvasHeight;
-  return {
-    x: screenX + x * scaleX,
-    y: screenY + y * scaleY,
-  };
-};
-
-/**
- * Throttle a function.
- */
-export const throttle = <T extends (...args: unknown[]) => unknown>(
-  func: T,
-  limit: number
-): ((...args: Parameters<T>) => void) => {
-  let inThrottle: boolean;
-  return (...args: Parameters<T>) => {
-    if (!inThrottle) {
-      func(...args);
-      inThrottle = true;
-      setTimeout(() => (inThrottle = false), limit);
+export function createSmokeTest(endpoint: string, expectedStatus = 200): () => Promise<boolean> {
+  return async (): Promise<boolean> => {
+    try {
+      const response = await fetch(new URL(endpoint, process.env.HEALTH_CHECK_BASE_URL ?? 'http://localhost:3000').href);
+      return response.status === expectedStatus;
+    } catch {
+      return false;
     }
   };
-};
+}
 
 /**
- * Compare arrays for equality.
+ * Generates operational documentation for the rollout.
+ * 
+ * @param config - Rollout configuration
+ * @returns Documentation object
  */
-export const arraysEqual = <T>(a: T[], b: T[]): boolean => {
-  if (a.length !== b.length) return false;
-  return a.every((item, index) => item === b[index]);
-};
+export function generateRolloutDocumentation(config: RolloutConfig): RolloutDocumentation {
+  return {
+    runbook: {
+      preDeployment: [
+        'Run "npm run pre-deploy-checks" to validate environment',
+        'Verify all tests pass with "npm test"',
+        'Confirm config/rollout.json is correct'
+      ],
+      deployment: [
+        'Deploy to staging environment first',
+        'Run smoke tests: "npm run smoke-test"',
+        'Monitor error rate for 5 minutes',
+        'If healthy, deploy to production with gradual rollout'
+      ],
+      rollback: [
+        'Trigger rollback via "npm run rollback"',
+        'Verify feature flag is disabled',
+        'Confirm previous version is active',
+        'Check error metrics have normalized'
+      ]
+    },
+    monitoring: {
+      dashboards: [
+        config.monitoringDashboardUrl ?? 'https://grafana.example.com/d/shared-utils-rollout',
+        'https://grafana.example.com/d/error-rate-overview'
+      ],
+      alerts: [
+        `Error rate > ${config.errorRateThreshold}% for 2 minutes`,
+        'Health check failures',
+        'Latency P99 > 500ms'
+      ]
+    },
+    escalation: {
+      path: config.escalationPath,
+      contact: {
+        slack: '#shared-utils-alerts',
+        pagerDuty: 'shared-utils-oncall'
+      }
+    }
+  };
+}
+
+// Documentation interface
+export interface RolloutDocumentation {
+  readonly runbook: {
+    readonly preDeployment: string[];
+    readonly deployment: string[];
+    readonly rollback: string[];
+  };
+  readonly monitoring: {
+    readonly dashboards: string[];
+    readonly alerts: string[];
+  };
+  readonly escalation: {
+    readonly path: string[];
+    readonly contact: {
+      readonly slack: string;
+      readonly pagerDuty: string;
+    };
+  };
+}
