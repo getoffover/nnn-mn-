@@ -1,294 +1,148 @@
-```typescript
-import { app, BrowserWindow, screen, globalShortcut, nativeImage, Rectangle } from 'electron';
-import path from 'path';
-import { setupIPC } from './infrastructure/electron/WindowManagerAdapter';
-import { setupLogWriter } from './infrastructure/electron/LogWriterAdapter';
-import { setupWorkerOrchestrator } from './infrastructure/electron/WorkerOrchestrator';
-import { setupDesktopCapturer } from './infrastructure/electron/DesktopCapturerAdapter';
-import { setupConfigUseCase } from './application/useCases/ConfigUseCase';
-import { setupLoggingUseCase } from './application/useCases/LoggingUseCase';
-import { setupEquityUseCase } from './application/useCases/EquityUseCase';
-import { setupStrategyUseCase } from './application/useCases/StrategyUseCase';
-import { setupVisionUseCase } from './application/useCases/VisionUseCase';
-import { visionStore } from './application/state/stores/visionStore';
-import { equityStore } from './application/state/stores/equityStore';
-import { uiStore } from './application/state/stores/uiStore';
-import { setupLocalStorageAdapter } from './application/state/adapters/LocalStorageAdapter';
-import { Logger } from './domain/shared/Logger';
-import { Result } from './domain/shared/Result';
-import { constants } from './shared/constants';
+ts
+/**
+ * Main process entry point for Electron application.
+ * Handles application lifecycle, window management, and IPC setup.
+ */
 
-// Initialize logger first
-const logger = new Logger('main');
+import { app, BrowserWindow, ipcMain, shell } from 'electron';
+import * as path from 'path';
+import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
 
-// Store reference to the main window
-let mainWindow: BrowserWindow | null = null;
-let overlayWindow: BrowserWindow | null = null;
+// Support for ES module imports in Electron main process
+const require = createRequire(import.meta.url);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 /**
- * Creates the main application window with transparent background and no frame.
- * Configures window properties for overlay behavior.
+ * Creates the main application window.
+ * @returns {BrowserWindow} The created browser window instance.
  */
-function createMainWindow(): BrowserWindow {
-  const display = screen.getPrimaryDisplay();
-  const { width, height } = display.workAreaSize;
-
-  const windowOptions: Electron.BrowserWindowConstructorOptions = {
-    width,
-    height,
-    x: 0,
-    y: 0,
-    transparent: true,
-    frame: false,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    focusable: false,
-    hasShadow: false,
+function createWindow(): BrowserWindow {
+  const mainWindow = new BrowserWindow({
+    width: 1200,
+    height: 800,
     webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true,
-      enableRemoteModule: false,
+      // Preload script is loaded before renderer process starts
       preload: path.join(__dirname, 'preload.js'),
+      // Enable remote module for compatibility (deprecated in Electron v20+, but required for some use cases)
+      // In new apps, avoid remote and use direct IPC instead
+      contextIsolation: true,
+      nodeIntegration: false,
       sandbox: true,
     },
-  };
+    backgroundColor: '#1a1a1a',
+    autoHideMenuBar: true,
+    titleBarStyle: 'hiddenInset',
+  });
 
-  const window = new BrowserWindow(windowOptions);
-  
   // Load the app
-  if (app.isPackaged) {
-    window.loadFile(path.join(__dirname, '../index.html'));
+  if (process.env.VITE_DEV_SERVER_URL) {
+    // In development, load from Vite dev server
+    void mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
   } else {
-    window.loadURL(`file://${path.join(__dirname, '../index.html')}`);
+    // In production, load from built files
+    void mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
   }
 
-  // Hide window on blur to avoid interfering with gameplay
-  window.on('blur', () => {
-    if (uiStore.getState().isOverlayVisible) {
-      window.hide();
+  // Open DevTools in development
+  if (process.env.NODE_ENV === 'development') {
+    mainWindow.webContents.openDevTools();
+  }
+
+  // Handle external links in default browser
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    // Block navigation to external URLs in development for security
+    if (process.env.NODE_ENV === 'development') {
+      return { action: 'deny' };
     }
+    // In production, open external URLs in default browser
+    void shell.openExternal(url);
+    return { action: 'deny' };
   });
 
-  window.on('focus', () => {
-    if (uiStore.getState().isOverlayVisible) {
-      window.show();
-    }
-  });
-
-  return window;
+  return mainWindow;
 }
 
 /**
- * Creates the overlay window that sits on top of the target application.
- * Configured for click-through and always-on-top behavior.
+ * Handles application lifecycle events.
+ * Ensures single instance and proper cleanup.
  */
-function createOverlayWindow(): BrowserWindow {
-  const display = screen.getPrimaryDisplay();
-  const { width, height } = display.workAreaSize;
-
-  const windowOptions: Electron.BrowserWindowConstructorOptions = {
-    width,
-    height,
-    x: 0,
-    y: 0,
-    transparent: true,
-    frame: false,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    focusable: false,
-    hasShadow: false,
-    webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true,
-      enableRemoteModule: false,
-      preload: path.join(__dirname, 'preload.js'),
-      sandbox: true,
-    },
-  };
-
-  const window = new BrowserWindow(windowOptions);
-
-  // Make window click-through
-  window.setIgnoreMouseEvents(true);
-
-  // Load the overlay
-  if (app.isPackaged) {
-    window.loadFile(path.join(__dirname, '../overlay.html'));
-  } else {
-    window.loadURL(`file://${path.join(__dirname, '../overlay.html')}`);
-  }
-
-  // Handle visibility toggle
-  window.on('show', () => {
-    uiStore.getState().setOverlayVisible(true);
-  });
-
-  window.on('hide', () => {
-    uiStore.getState().setOverlayVisible(false);
-  });
-
-  return window;
-}
-
-/**
- * Registers global shortcuts for toggling the overlay and other features.
- */
-function registerGlobalShortcuts(): void {
-  const { overlayToggleKey, configToggleKey } = constants.shortcuts;
-
-  const result = globalShortcut.register(overlayToggleKey, () => {
-    if (overlayWindow) {
-      if (overlayWindow.isVisible()) {
-        overlayWindow.hide();
-      } else {
-        overlayWindow.show();
-      }
-    }
-  });
-
-  if (!result) {
-    logger.warn(`Failed to register overlay toggle shortcut: ${overlayToggleKey}`);
-  }
-
-  const configResult = globalShortcut.register(configToggleKey, () => {
-    if (mainWindow) {
-      if (mainWindow.isVisible()) {
-        mainWindow.hide();
-      } else {
-        mainWindow.show();
-        mainWindow.focus();
-      }
-    }
-  });
-
-  if (!configResult) {
-    logger.warn(`Failed to register config toggle shortcut: ${configToggleKey}`);
-  }
-}
-
-/**
- * Unregisters all global shortcuts on app quit.
- */
-function unregisterGlobalShortcuts(): void {
-  globalShortcut.unregisterAll();
-}
-
-/**
- * Initializes the application state stores using LocalStorageAdapter.
- */
-function initializeStateStores(): void {
-  const localStorageAdapter = setupLocalStorageAdapter();
-  
-  // Hydrate stores from localStorage
-  const visionResult = visionStore.hydrate(localStorageAdapter);
-  if (visionResult.isErr()) {
-    logger.error(`Failed to hydrate vision store: ${visionResult.error.message}`);
-  }
-
-  const equityResult = equityStore.hydrate(localStorageAdapter);
-  if (equityResult.isErr()) {
-    logger.error(`Failed to hydrate equity store: ${equityResult.error.message}`);
-  }
-
-  const uiResult = uiStore.hydrate(localStorageAdapter);
-  if (uiResult.isErr()) {
-    logger.error(`Failed to hydrate ui store: ${uiResult.error.message}`);
-  }
-
-  // Setup persistence
-  const disposeVision = visionStore.subscribe(() => {
-    localStorageAdapter.setItem('vision', JSON.stringify(visionStore.getState()));
-  });
-
-  const disposeEquity = equityStore.subscribe(() => {
-    localStorageAdapter.setItem('equity', JSON.stringify(equityStore.getState()));
-  });
-
-  const disposeUI = uiStore.subscribe(() => {
-    localStorageAdapter.setItem('ui', JSON.stringify(uiStore.getState()));
-  });
-
-  // Store dispose functions for cleanup
-  (global as any).stateDisposers = [disposeVision, disposeEquity, disposeUI];
-}
-
-/**
- * Cleans up state stores and registered shortcuts on app quit.
- */
-function cleanup(): void {
-  unregisterGlobalShortcuts();
-  
-  if ((global as any).stateDisposers) {
-    (global as any).stateDisposers.forEach((dispose: () => void) => dispose());
-  }
-}
-
-/**
- * Main application entry point.
- * Sets up windows, IPC, workers, and use cases.
- */
-app.whenReady().then(async () => {
-  try {
-    // Initialize state stores
-    initializeStateStores();
-
-    // Create main window (for configuration)
-    mainWindow = createMainWindow();
-
-    // Create overlay window
-    overlayWindow = createOverlayWindow();
-
-    // Setup IPC handlers
-    setupIPC(overlayWindow, mainWindow);
-
-    // Setup logging infrastructure
-    setupLogWriter();
-
-    // Setup worker orchestrator
-    setupWorkerOrchestrator();
-
-    // Setup desktop capturer
-    setupDesktopCapturer();
-
-    // Setup use cases
-    setupConfigUseCase();
-    setupLoggingUseCase();
-    setupEquityUseCase();
-    setupStrategyUseCase();
-    setupVisionUseCase();
-
-    // Register global shortcuts
-    registerGlobalShortcuts();
-
-    // Log startup success
-    logger.info('PPPoker Overlay initialized successfully');
-
-  } catch (error) {
-    logger.error(`Failed to initialize application: ${error instanceof Error ? error.message : 'Unknown error'}`);
+function handleAppLifecycle(): void {
+  // Prevent multiple instances
+  const gotTheLock = app.requestSingleInstanceLock();
+  if (!gotTheLock) {
     app.quit();
+    return;
   }
-});
 
-// Handle app lifecycle events
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
-});
-
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
-    if (mainWindow === null) {
-      mainWindow = createMainWindow();
+  app.on('second-instance', () => {
+    // Someone tried to run a second instance, focus our window
+    const window = BrowserWindow.getAllWindows()[0];
+    if (window) {
+      if (window.isMinimized()) window.restore();
+      window.focus();
     }
-    if (overlayWindow === null) {
-      overlayWindow = createOverlayWindow();
-    }
-  }
-});
+  });
 
-// Cleanup on quit
-app.on('before-quit', () => {
-  cleanup();
-});
-```
+  app.whenReady().then(() => {
+    createWindow();
+
+    app.on('activate', () => {
+      // On macOS, re-create window if no windows are open
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow();
+      }
+    });
+  });
+
+  app.on('window-all-closed', () => {
+    // On Windows/Linux, quit when all windows are closed
+    // On macOS, quit only when user explicitly quits (Cmd+Q)
+    if (process.platform !== 'darwin') {
+      app.quit();
+    }
+  });
+}
+
+/**
+ * Registers IPC handlers for main/renderer communication.
+ */
+function registerIpcHandlers(): void {
+  // Example: Handle ping-pong communication
+  ipcMain.handle('ping', () => {
+    return 'pong';
+  });
+
+  // Example: Handle system information requests
+  ipcMain.handle('get-app-version', () => {
+    return app.getVersion();
+  });
+
+  ipcMain.handle('get-platform', () => {
+    return process.platform;
+  });
+
+  // Error handling for unhandled IPC calls
+  ipcMain.on('unhandled-message', (event, message) => {
+    console.warn('Unhandled IPC message:', message);
+    event.sender.send('unhandled-message-error', { message });
+  });
+}
+
+/**
+ * Initializes the Electron application.
+ * Sets up environment, handlers, and starts the app.
+ */
+function initializeApp(): void {
+  // Set environment variables for development
+  if (process.env.NODE_ENV === 'development') {
+    process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true';
+  }
+
+  handleAppLifecycle();
+  registerIpcHandlers();
+}
+
+// Start the application
+initializeApp();
